@@ -1,0 +1,1173 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Akira Racing - WebXR Meta Quest 3 (Optimized)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <script type="importmap">
+  {"imports": {"three": "https://unpkg.com/three@0.150.1/build/three.module.js"}}
+  </script>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; font-family: 'Courier New', monospace; }
+    #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; display: flex; align-items: center; justify-content: center; background: radial-gradient(ellipse at center, #1a0033 0%, #000 100%); }
+    #start-button { width: 90vw; height: 90vh; max-width: 900px; max-height: 900px; background: url('picture1.jpg') center/contain no-repeat; border: 4px solid #ff006e; cursor: pointer; box-shadow: 0 0 60px #ff006e, inset 0 0 30px rgba(255,0,110,0.2); animation: pulse 2s infinite; border-radius: 15px; }
+    @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.05); } }
+    .webxr-hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div id="overlay"><button id="start-button"></button></div>
+  <audio id="bgMusic" src="futurecity.mp3" loop preload="auto"></audio>
+  <script type="module">
+    import * as THREE from 'three';
+    
+    let camera, scene, renderer, xrSession, clock = new THREE.Clock();
+    let activeController, controllers = [], activeControllerIndex = 0;
+    let bike, roadSegments = [], obstacles = [], particles = [];
+    let currentLane = 1, targetLane = 1, speed = 0.15, score = 0, time = 0;
+    let lightTrail, trailPoints = [], engineGlow, boostParticles = [];
+    let blinkingWindows = [];
+    const LANES = [-0.18, 0, 0.18], SEGMENT_LENGTH = 2;
+    const GROUND_HEIGHT = -0.3;
+    
+    let isControllerSelectionPhase = false, controllerSelectionStartTime = 0;
+    let controllerHoldStartTime = {}, selectedController = null;
+    let animatedBillboards = [];
+    let currentEnvironment = 'city', environmentCounter = 50;
+    
+    // Drone billboard variables
+    let droneBillboard = null, drones = [], droneText = 'be different', droneTextTimer = 0;
+    const droneMessages = ['be different', 'buy unique'];
+    let currentMessageIndex = 0;
+
+    // --- OPTIMIZATION ASSETS ---
+    let tunnelAssets = {};
+
+    // Start background music on page load
+    window.addEventListener('DOMContentLoaded', () => {
+      const bgMusic = document.getElementById('bgMusic');
+      bgMusic.volume = 0.3;
+      bgMusic.play().catch(e => {
+        console.log('Audio autoplay prevented, will play on user interaction');
+        document.addEventListener('click', function playMusic() {
+          bgMusic.play();
+          document.removeEventListener('click', playMusic);
+        }, { once: true });
+      });
+    });
+
+    init();
+    
+    function init() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
+      
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.2;
+      document.body.appendChild(renderer.domElement);
+      
+      scene.fog = new THREE.FogExp2(0x000011, 0.05);
+      const ambient = new THREE.AmbientLight(0x1a0033, 0.3);
+      scene.add(ambient);
+      
+      const neon1 = new THREE.PointLight(0xff006e, 3, 15);
+      neon1.position.set(3, GROUND_HEIGHT + 3.3, -3);
+      scene.add(neon1);
+      
+      const neon2 = new THREE.PointLight(0x00ffff, 3, 15);
+      neon2.position.set(-3, GROUND_HEIGHT + 3.3, -3);
+      scene.add(neon2);
+      
+      const neon3 = new THREE.SpotLight(0x8338ec, 2, 20, Math.PI / 4, 0.5);
+      neon3.position.set(0, GROUND_HEIGHT + 5.3, -5);
+      neon3.target.position.set(0, GROUND_HEIGHT, -10);
+      scene.add(neon3);
+      scene.add(neon3.target);
+      
+      // --- OPTIMIZATION: Initialize all tunnel assets ONCE ---
+      initTunnelAssets();
+      
+      createBike();
+      createLightTrail();
+      generateRoad();
+      createCityscape();
+      createDroneBillboard();
+      
+      document.getElementById('start-button').addEventListener('click', () => {
+        const bgMusic = document.getElementById('bgMusic');
+        if (bgMusic.paused) {
+          bgMusic.play().catch(e => console.log('Music start failed:', e));
+        }
+        startARSession();
+      });
+      window.addEventListener('resize', onWindowResize);
+    }
+    
+    function createDroneBillboard() {
+      droneBillboard = new THREE.Group();
+      droneBillboard.position.set(0, GROUND_HEIGHT + 2.5, -4);
+      scene.add(droneBillboard);
+      
+      const billboardLight = new THREE.PointLight(0xffffff, 1, 8);
+      billboardLight.position.set(0, 0.5, 0);
+      droneBillboard.add(billboardLight);
+      
+      for (let i = 0; i < 120; i++) {
+        const droneGeo = new THREE.BoxGeometry(0.025, 0.025, 0.025);
+        const droneMat = new THREE.MeshBasicMaterial({
+          color: 0xffffff,
+          emissive: 0xffffff,
+          emissiveIntensity: 2
+        });
+        const drone = new THREE.Mesh(droneGeo, droneMat);
+        drone.userData = {
+          targetPos: new THREE.Vector3(),
+          currentPos: new THREE.Vector3(
+            (Math.random() - 0.5) * 3,
+            (Math.random() - 0.5) * 1.5,
+            (Math.random() - 0.5) * 0.5
+          ),
+          blinkSpeed: 3 + Math.random() * 2,
+          isActive: false
+        };
+        drone.position.copy(drone.userData.currentPos);
+        drones.push(drone);
+        droneBillboard.add(drone);
+      }
+    }
+    
+    function updateDroneBillboard() {
+      droneTextTimer += 0.016;
+      
+      if (droneTextTimer > 5) {
+        droneTextTimer = 0;
+        currentMessageIndex = (currentMessageIndex + 1) % droneMessages.length;
+        droneText = droneMessages[currentMessageIndex];
+      }
+      
+      const letterPatterns = {
+        'b': [[0,0],[0,1],[0,2],[0,3],[0,4],[1,0],[1,2],[1,4],[2,1],[2,3]],
+        'e': [[0,0],[0,1],[0,2],[0,3],[0,4],[1,0],[1,2],[1,4],[2,0],[2,2],[2,4]],
+        'd': [[0,0],[0,1],[0,2],[0,3],[0,4],[1,0],[1,4],[2,1],[2,2],[2,3]],
+        'i': [[0,0],[0,4],[1,0],[1,1],[1,2],[1,3],[1,4],[2,0],[2,4]],
+        'f': [[0,0],[0,1],[0,2],[0,3],[0,4],[1,0],[1,2],[2,0],[2,2]],
+        'r': [[0,0],[0,1],[0,2],[0,3],[0,4],[1,0],[1,2],[2,0],[2,1],[2,3],[2,4]],
+        'n': [[0,0],[0,1],[0,2],[0,3],[0,4],[1,1],[2,0],[2,1],[2,2],[2,3],[2,4]],
+        't': [[0,0],[1,0],[1,1],[1,2],[1,3],[1,4],[2,0]],
+        'u': [[0,0],[0,1],[0,2],[0,3],[0,4],[1,4],[2,0],[2,1],[2,2],[2,3],[2,4]],
+        'y': [[0,0],[0,1],[0,2],[1,2],[1,3],[1,4],[2,0],[2,1],[2,2]],
+        'q': [[0,1],[0,2],[0,3],[1,0],[1,4],[2,1],[2,2],[2,3],[2,4]],
+        ' ': []
+      };
+      
+      const charSpacing = 0.18;
+      const letterScale = 0.12;
+      let totalWidth = droneText.length * 3 * charSpacing;
+      let xOffset = -totalWidth / 2;
+      let droneIndex = 0;
+      
+      for (let charIndex = 0; charIndex < droneText.length; charIndex++) {
+        const char = droneText[charIndex];
+        const pattern = letterPatterns[char] || [];
+        
+        pattern.forEach(([x, y]) => {
+          if (droneIndex < drones.length) {
+            const drone = drones[droneIndex];
+            drone.userData.targetPos.set(
+              xOffset + x * letterScale,
+              0.5 - y * letterScale,
+              0
+            );
+            drone.userData.isActive = true;
+            droneIndex++;
+          }
+        });
+        
+        xOffset += 3 * charSpacing;
+      }
+      
+      for (let i = droneIndex; i < drones.length; i++) {
+        drones[i].userData.isActive = false;
+      }
+      
+      drones.forEach((drone) => {
+        if (drone.userData.isActive) {
+          drone.visible = true;
+          drone.userData.currentPos.lerp(drone.userData.targetPos, 0.08);
+          drone.position.copy(drone.userData.currentPos);
+          
+          const pulse = Math.sin(time * drone.userData.blinkSpeed) * 0.1 + 0.9;
+          drone.material.emissiveIntensity = 1.5 * pulse;
+          
+          drone.rotation.x += 0.02;
+          drone.rotation.y += 0.01;
+        } else {
+          drone.visible = false;
+        }
+      });
+      
+      droneBillboard.position.x = 0;
+      droneBillboard.position.z = -4;
+    }
+    
+    function createBike() {
+        bike = new THREE.Group();
+        const chassisShape = new THREE.Shape();
+        chassisShape.moveTo(-0.04, 0);
+        chassisShape.bezierCurveTo(-0.05, 0.05, 0.05, 0.05, 0.04, 0);
+        chassisShape.lineTo(-0.04, 0);
+
+        const chassisGeo = new THREE.ExtrudeGeometry(chassisShape, {
+            depth: 0.22,
+            bevelEnabled: true,
+            bevelThickness: 0.005,
+            bevelSize: 0.005,
+            bevelSegments: 8
+        });
+        const chassisMat = new THREE.MeshPhongMaterial({
+            color: 0xff0040,
+            emissive: 0xcc0033,
+            emissiveIntensity: 0.6,
+            shininess: 100,
+            specular: 0xffffff
+        });
+        const chassis = new THREE.Mesh(chassisGeo, chassisMat);
+        chassis.rotation.x = Math.PI / 2;
+        chassis.position.set(0, 0.03, 0.11);
+        bike.add(chassis);
+
+        const coreGeo = new THREE.SphereGeometry(0.025, 16, 16);
+        const coreMat = new THREE.MeshBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.9 });
+        const core = new THREE.Mesh(coreGeo, coreMat);
+        core.position.set(0, 0.045, -0.01);
+        bike.add(core);
+
+        const engineGlowGeo = new THREE.ConeGeometry(0.03, 0.08, 8);
+        const engineGlowMat = new THREE.MeshBasicMaterial({ color: 0xff0033, transparent: true, opacity: 0.7, side: THREE.DoubleSide });
+        engineGlow = new THREE.Mesh(engineGlowGeo, engineGlowMat);
+        engineGlow.rotation.x = Math.PI / 2;
+        engineGlow.position.set(0, 0.03, 0.15);
+        bike.add(engineGlow);
+
+        const tailLightGeo = new THREE.BoxGeometry(0.06, 0.015, 0.005);
+        const tailLightMat = new THREE.MeshBasicMaterial({ color: 0xff0000, emissive: 0xff0000, emissiveIntensity: 2 });
+        const tailLight = new THREE.Mesh(tailLightGeo, tailLightMat);
+        tailLight.position.set(0, 0.035, 0.12);
+        bike.add(tailLight);
+        const tailLightGlow = new THREE.PointLight(0xff0000, 0.5, 0.3);
+        tailLightGlow.position.copy(tailLight.position);
+        bike.add(tailLightGlow);
+
+        const wheelGeo = new THREE.TorusGeometry(0.03, 0.008, 8, 16);
+        const wheelMat = new THREE.MeshPhongMaterial({ color: 0x111111, emissive: 0x00ffff, emissiveIntensity: 0.4, metalness: 0.8, roughness: 0.2 });
+        const frontWheel = new THREE.Mesh(wheelGeo, wheelMat);
+        frontWheel.rotation.y = Math.PI / 2;
+        frontWheel.position.set(0, 0.03, -0.08);
+        bike.add(frontWheel);
+        const rearWheel = new THREE.Mesh(wheelGeo, wheelMat);
+        rearWheel.rotation.y = Math.PI / 2;
+        rearWheel.position.set(0, 0.03, 0.08);
+        bike.add(rearWheel);
+
+        const riderBody = new THREE.Mesh(new THREE.CapsuleGeometry(0.02, 0.04, 8, 8), new THREE.MeshPhongMaterial({ color: 0x0a0a0a, emissive: 0x220044, emissiveIntensity: 0.2 }));
+        riderBody.position.set(0, 0.08, 0.02);
+        bike.add(riderBody);
+        const helmet = new THREE.Mesh(new THREE.SphereGeometry(0.025, 12, 8), new THREE.MeshPhongMaterial({ color: 0x111111, emissive: 0xff006e, emissiveIntensity: 0.3, metalness: 0.9, roughness: 0.1 }));
+        helmet.position.set(0, 0.11, 0.01);
+        bike.add(helmet);
+
+        const visorGeo = new THREE.SphereGeometry(0.026, 12, 8, 0, Math.PI, 0, Math.PI / 3);
+        const visorMat = new THREE.MeshPhysicalMaterial({ color: 0x00ffff, transparent: true, opacity: 0.4, metalness: 0.9, roughness: 0, transmission: 0.5 });
+        const visor = new THREE.Mesh(visorGeo, visorMat);
+        visor.position.set(0, 0.11, 0.01);
+        visor.rotation.x = -Math.PI / 6;
+        bike.add(visor);
+        
+        bike.position.set(0, GROUND_HEIGHT + 0.05, -0.8);
+        bike.castShadow = true;
+        scene.add(bike);
+    }
+    
+    function createLightTrail() {
+      const trailGeo = new THREE.BufferGeometry();
+      const positions = new Float32Array(300);
+      const colors = new Float32Array(300);
+      
+      trailGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      trailGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      
+      const trailMat = new THREE.LineBasicMaterial({
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.9,
+        linewidth: 4,
+        blending: THREE.AdditiveBlending
+      });
+      
+      lightTrail = new THREE.Line(trailGeo, trailMat);
+      scene.add(lightTrail);
+      
+      for (let i = 0; i < 100; i++) {
+        trailPoints.push({ x: 0, y: GROUND_HEIGHT + 0.02, z: -0.8 });
+      }
+    }
+    
+    function updateLightTrail() {
+      const swirl = Math.sin(time * 10) * 0.01;
+      trailPoints.unshift({
+        x: bike.position.x + swirl,
+        y: bike.position.y - 0.02,
+        z: bike.position.z + 0.12
+      });
+      trailPoints.pop();
+      
+      const positions = lightTrail.geometry.attributes.position.array;
+      const colors = lightTrail.geometry.attributes.color.array;
+      const flicker = Math.random() > 0.2 ? 1 : 0.6;
+      
+      for (let i = 0; i < trailPoints.length; i++) {
+        const point = trailPoints[i];
+        const idx = i * 3;
+        
+        positions[idx] = point.x;
+        positions[idx + 1] = point.y;
+        positions[idx + 2] = point.z + i * 0.005;
+        
+        const t = i / trailPoints.length;
+        const intensity = (1 - t * 0.6) * flicker;
+        colors[idx] = intensity;
+        colors[idx + 1] = intensity * 0.1;
+        colors[idx + 2] = intensity * 0.2;
+      }
+      
+      lightTrail.material.opacity = 0.7 + Math.random() * 0.3;
+      lightTrail.geometry.attributes.position.needsUpdate = true;
+      lightTrail.geometry.attributes.color.needsUpdate = true;
+    }
+    
+    function generateRoad() {
+      for (let i = 0; i < 25; i++) {
+        createNextSegment(-1 - i * SEGMENT_LENGTH);
+      }
+    }
+
+    function createNextSegment(zPos) {
+        // This function now acts as a router based on the environment
+        let segment;
+        if (currentEnvironment === 'tunnel') {
+            segment = createOptimizedTunnelSegment();
+        } else if (currentEnvironment === 'bridge') {
+            segment = createBridgeSegment();
+        } else {
+            segment = createRoadSegment();
+        }
+        segment.position.z = zPos;
+        scene.add(segment);
+        roadSegments.push(segment);
+    }
+    
+    function createRoadSegment() {
+      const segment = new THREE.Group();
+      
+      // Standard Road
+      const roadGeo = new THREE.PlaneGeometry(0.7, SEGMENT_LENGTH + 0.01);
+      const roadMat = new THREE.MeshPhongMaterial({ 
+        color: 0x0a0a1a,
+        emissive: 0x000022,
+        emissiveIntensity: 0.3,
+        metalness: 0.8,
+        roughness: 0.3
+      });
+      const road = new THREE.Mesh(roadGeo, roadMat);
+      road.rotation.x = -Math.PI / 2;
+      road.position.y = GROUND_HEIGHT;
+      road.receiveShadow = true;
+      segment.add(road);
+      
+      for (let lane = 0; lane < 4; lane++) {
+        const lineGeo = new THREE.BoxGeometry(0.005, 0.002, SEGMENT_LENGTH * 0.9);
+        const lineMat = new THREE.MeshBasicMaterial({ 
+          color: lane % 2 ? 0xff006e : 0x00ffff,
+          transparent: true,
+          opacity: 0.9
+        });
+        const line = new THREE.Mesh(lineGeo, lineMat);
+        line.position.set([-0.27, -0.09, 0.09, 0.27][lane], GROUND_HEIGHT + 0.001, 0);
+        segment.add(line);
+        
+        const glowGeo = new THREE.PlaneGeometry(0.02, SEGMENT_LENGTH * 0.9);
+        const glowMat = new THREE.MeshBasicMaterial({
+          color: line.material.color,
+          transparent: true,
+          opacity: 0.3,
+          side: THREE.DoubleSide
+        });
+        const glow = new THREE.Mesh(glowGeo, glowMat);
+        glow.rotation.x = -Math.PI / 2;
+        glow.position.copy(line.position);
+        glow.position.y = GROUND_HEIGHT + 0.0005;
+        segment.add(glow);
+      }
+      
+      for (let side = 0; side < 2; side++) {
+        const barrierGeo = new THREE.BoxGeometry(0.02, 0.08, SEGMENT_LENGTH + 0.01);
+        const barrierMat = new THREE.MeshPhongMaterial({
+          color: 0x222244,
+          emissive: 0x8338ec,
+          emissiveIntensity: 0.2
+        });
+        const barrier = new THREE.Mesh(barrierGeo, barrierMat);
+        barrier.position.set(side === 0 ? -0.36 : 0.36, GROUND_HEIGHT + 0.04, 0);
+        segment.add(barrier);
+        
+        if (Math.random() > 0.5) {
+          const lightGeo = new THREE.BoxGeometry(0.01, 0.01, 0.2);
+          const lightMat = new THREE.MeshBasicMaterial({ color: 0xffaa00 });
+          const light = new THREE.Mesh(lightGeo, lightMat);
+          light.position.set(side === 0 ? -0.35 : 0.35, GROUND_HEIGHT + 0.08, 0);
+          segment.add(light);
+        }
+      }
+
+      if (Math.random() > 0.4) {
+        const isCar = Math.random() > 0.5;
+        const obstacle = isCar ? createCarObstacle() : createEnhancedObstacle();
+        const yPos = isCar ? GROUND_HEIGHT + 0.04 : GROUND_HEIGHT + 0.05;
+
+        obstacle.position.set(LANES[Math.floor(Math.random() * 3)], yPos, 0);
+        segment.add(obstacle);
+        obstacles.push({ mesh: obstacle, segment: segment, lane: obstacle.position.x });
+      }
+      return segment;
+    }
+
+    /**
+     * OPTIMIZATION: Creates all tunnel assets ONCE at the start of the game.
+     * This avoids creating new geometries and materials in the game loop.
+     */
+    function initTunnelAssets() {
+        const wallHeight = 0.8;
+        const tunnelWidth = 0.8;
+        const roadWidth = 0.7;
+
+        // 1. Create a single, combined geometry for the tunnel shell (walls, ceiling)
+        const tunnelShellGeo = new THREE.BufferGeometry();
+        const halfLength = SEGMENT_LENGTH / 2;
+        const halfWidth = tunnelWidth / 2;
+        const halfRoadWidth = roadWidth / 2; // Not used for shell walls, but for context
+
+        const vertices = new Float32Array([
+            // Left Wall
+            -halfWidth, GROUND_HEIGHT, -halfLength, -halfWidth, GROUND_HEIGHT + wallHeight, -halfLength, -halfWidth, GROUND_HEIGHT + wallHeight, halfLength,
+            -halfWidth, GROUND_HEIGHT, -halfLength, -halfWidth, GROUND_HEIGHT + wallHeight,  halfLength, -halfWidth, GROUND_HEIGHT,  halfLength,
+            // Right Wall
+             halfWidth, GROUND_HEIGHT, -halfLength,  halfWidth, GROUND_HEIGHT, halfLength,  halfWidth, GROUND_HEIGHT + wallHeight, halfLength,
+             halfWidth, GROUND_HEIGHT, -halfLength,  halfWidth, GROUND_HEIGHT + wallHeight, halfLength,  halfWidth, GROUND_HEIGHT + wallHeight, -halfLength,
+            // Ceiling
+            -halfWidth, GROUND_HEIGHT + wallHeight, -halfLength, -halfWidth, GROUND_HEIGHT + wallHeight, halfLength,  halfWidth, GROUND_HEIGHT + wallHeight, halfLength,
+            -halfWidth, GROUND_HEIGHT + wallHeight, -halfLength,  halfWidth, GROUND_HEIGHT + wallHeight, halfLength,  halfWidth, GROUND_HEIGHT + wallHeight, -halfLength
+        ]);
+        const uvs = new Float32Array([
+            // Left Wall (Repeats vertically for texture)
+            0, 0, 0, 1, 1, 1,    0, 0, 1, 1, 1, 0,
+            // Right Wall (Repeats vertically for texture)
+            1, 0, 0, 0, 0, 1,    1, 0, 0, 1, 1, 1,
+            // Ceiling (Repeats for texture)
+            0, 1, 0, 0, 1, 0,    0, 1, 1, 0, 1, 1
+        ]);
+
+        tunnelShellGeo.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+        tunnelShellGeo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+        tunnelShellGeo.computeVertexNormals();
+        tunnelAssets.shellGeo = tunnelShellGeo;
+
+        // 2. Create a simple, low-res texture to fake detail and lighting
+        const canvas = document.createElement('canvas');
+        canvas.width = 64;
+        canvas.height = 64;
+        const ctx = canvas.getContext('2d');
+        const gradient = ctx.createLinearGradient(0, 0, 0, 64);
+        gradient.addColorStop(0, '#1a1a2a');
+        gradient.addColorStop(0.8, '#101020');
+        gradient.addColorStop(1, '#050510');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, 64, 64);
+        ctx.fillStyle = '#333';
+        ctx.fillRect(0, 31, 64, 2); // Horizontal line
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.wrapS = THREE.RepeatWrapping;
+        texture.wrapT = THREE.RepeatWrapping;
+        texture.repeat.set(SEGMENT_LENGTH, wallHeight); // Adjust repeat based on segment length and wall height
+
+        // 3. Create a single, cheap material for the tunnel walls
+        tunnelAssets.shellMat = new THREE.MeshBasicMaterial({
+            color: 0xaaaaee, // Base color
+            map: texture
+        });
+        
+        // 4. Create reusable geometry and materials for lights and ads
+        tunnelAssets.lightGeo = new THREE.BoxGeometry(0.1, 0.015, SEGMENT_LENGTH);
+        tunnelAssets.lightMatCyan = new THREE.MeshBasicMaterial({ color: 0x00ffff, emissive: 0x00ffff, emissiveIntensity: 1 });
+        tunnelAssets.lightMatMagenta = new THREE.MeshBasicMaterial({ color: 0xff006e, emissive: 0xff006e, emissiveIntensity: 1 });
+
+        // 5. Reusable Road and Ceiling for Tunnel (similar to city road)
+        tunnelAssets.roadGeo = new THREE.PlaneGeometry(0.7, SEGMENT_LENGTH + 0.01);
+        tunnelAssets.roadMat = new THREE.MeshPhongMaterial({ 
+          color: 0x0a0a1a,
+          emissive: 0x000022,
+          emissiveIntensity: 0.3,
+          metalness: 0.8,
+          roughness: 0.3
+        });
+
+        tunnelAssets.ceilingGeo = new THREE.PlaneGeometry(0.7, SEGMENT_LENGTH + 0.01);
+        tunnelAssets.ceilingMat = new THREE.MeshPhongMaterial({
+            color: 0x0a0a1a,
+            emissive: 0x000022,
+            emissiveIntensity: 0.3,
+            metalness: 0.8,
+            roughness: 0.3,
+            side: THREE.DoubleSide
+        });
+    }
+
+    /**
+     * OPTIMIZED: Creates a tunnel segment by cloning pre-made assets.
+     * This is extremely fast and avoids creating new geometries, materials, or lights.
+     */
+    function createOptimizedTunnelSegment() {
+        const segment = new THREE.Group();
+        segment.userData.isTunnel = true; // Flag for recycling logic
+
+        // Create the main tunnel shell (walls and ceiling) from pre-made assets
+        const shell = new THREE.Mesh(tunnelAssets.shellGeo, tunnelAssets.shellMat);
+        segment.add(shell);
+        
+        // Add road
+        const road = new THREE.Mesh(tunnelAssets.roadGeo, tunnelAssets.roadMat);
+        road.rotation.x = -Math.PI / 2;
+        road.position.y = GROUND_HEIGHT;
+        road.receiveShadow = true;
+        segment.add(road);
+
+        // Add ceiling (use a different material if desired, or clone roadMat)
+        const ceiling = new THREE.Mesh(tunnelAssets.ceilingGeo, tunnelAssets.ceilingMat);
+        ceiling.rotation.x = Math.PI / 2; // Rotate to face downwards
+        ceiling.position.y = GROUND_HEIGHT + 0.8; // Position above walls
+        segment.add(ceiling);
+
+        // Add lane lines (can also be baked into the floor texture for max performance)
+        for (let lane = 0; lane < 2; lane++) {
+            const lineGeo = new THREE.BoxGeometry(0.005, 0.002, SEGMENT_LENGTH * 0.9);
+            const lineMat = new THREE.MeshBasicMaterial({ color: 0x8338ec });
+            const line = new THREE.Mesh(lineGeo, lineMat);
+            line.position.set(lane === 0 ? -0.09 : 0.09, GROUND_HEIGHT + 0.001, 0);
+            segment.add(line);
+        }
+
+        // Randomly add a light strip by cloning a pre-made mesh
+        if (Math.random() > 0.3) {
+            const lightStrip = new THREE.Mesh(
+                tunnelAssets.lightGeo,
+                Math.random() > 0.5 ? tunnelAssets.lightMatCyan : tunnelAssets.lightMatMagenta
+            );
+            lightStrip.position.set(0, GROUND_HEIGHT + 0.8 - 0.01, 0);
+            segment.add(lightStrip);
+        }
+        
+        // Add obstacles as before
+        if (Math.random() > 0.7) { // Fewer obstacles in tunnels
+            const isCar = Math.random() > 0.5;
+            const obstacle = isCar ? createCarObstacle() : createEnhancedObstacle();
+            const yPos = isCar ? GROUND_HEIGHT + 0.04 : GROUND_HEIGHT + 0.05;
+            obstacle.position.set(LANES[Math.floor(Math.random() * 3)], yPos, 0);
+            segment.add(obstacle);
+            obstacles.push({ mesh: obstacle, segment: segment, lane: obstacle.position.x });
+        }
+
+        return segment;
+    }
+
+    function createBridgeSegment() {
+      const segment = new THREE.Group();
+      
+      const roadGeo = new THREE.PlaneGeometry(0.7, SEGMENT_LENGTH + 0.01);
+      const roadMat = new THREE.MeshPhongMaterial({ color: 0x1a1a2a, metalness: 0.9, roughness: 0.2 });
+      const road = new THREE.Mesh(roadGeo, roadMat);
+      road.rotation.x = -Math.PI / 2;
+      road.position.y = GROUND_HEIGHT;
+      road.receiveShadow = true;
+      segment.add(road);
+
+      for (let side = 0; side < 2; side++) {
+          const sideSign = side === 0 ? -1 : 1;
+          const railBaseGeo = new THREE.BoxGeometry(0.04, 0.05, SEGMENT_LENGTH + 0.01);
+          const railBaseMat = new THREE.MeshPhongMaterial({color: 0x222233});
+          const railBase = new THREE.Mesh(railBaseGeo, railBaseMat);
+          railBase.position.set(sideSign * 0.36, GROUND_HEIGHT + 0.025, 0);
+          segment.add(railBase);
+
+          const topRailGeo = new THREE.BoxGeometry(0.02, 0.01, SEGMENT_LENGTH + 0.01);
+          const topRailMat = new THREE.MeshBasicMaterial({color: 0xff006e, emissive: 0xff006e, emissiveIntensity: 2});
+          const topRail = new THREE.Mesh(topRailGeo, topRailMat);
+          topRail.position.set(sideSign * 0.36, GROUND_HEIGHT + 0.08, 0);
+          segment.add(topRail);
+      }
+
+      if (Math.random() > 0.6) {
+          const gantry = new THREE.Group();
+          const pillarGeo = new THREE.BoxGeometry(0.05, 0.6, 0.05);
+          const pillarMat = new THREE.MeshPhongMaterial({color: 0x333344});
+          
+          const pillarLeft = new THREE.Mesh(pillarGeo, pillarMat);
+          pillarLeft.position.set(-0.45, GROUND_HEIGHT + 0.3, 0);
+          gantry.add(pillarLeft);
+
+          const pillarRight = new THREE.Mesh(pillarGeo, pillarMat);
+          pillarRight.position.set(0.45, GROUND_HEIGHT + 0.3, 0);
+          gantry.add(pillarRight);
+
+          const crossbeamGeo = new THREE.BoxGeometry(1, 0.05, 0.05);
+          const crossbeam = new THREE.Mesh(crossbeamGeo, pillarMat);
+          crossbeam.position.set(0, GROUND_HEIGHT + 0.6, 0);
+          gantry.add(crossbeam);
+
+          const lightGeo = new THREE.BoxGeometry(0.1, 0.02, 0.02);
+          const lightMat = new THREE.MeshBasicMaterial({ color: 0x00ffff });
+          const gantryLight = new THREE.Mesh(lightGeo, lightMat);
+          gantryLight.position.set(0, GROUND_HEIGHT + 0.58, 0);
+          gantry.add(gantryLight);
+
+          segment.add(gantry);
+      }
+      return segment;
+    }
+
+    function createCarObstacle() {
+        const car = new THREE.Group();
+        
+        // Random metallic properties
+        const metalness = 0.7 + Math.random() * 0.3; // 0.7 to 1.0
+        const roughness = 0.2 + Math.random() * 0.4; // 0.2 to 0.6
+        const bodyColor = new THREE.Color().setHSL(Math.random(), 0.1, 0.15 + Math.random() * 0.2); // Darker, less saturated colors
+
+        const bodyGeo = new THREE.BoxGeometry(0.12, 0.07, 0.28);
+        const bodyMat = new THREE.MeshStandardMaterial({
+            color: bodyColor,
+            metalness: metalness,
+            roughness: roughness
+        });
+        const body = new THREE.Mesh(bodyGeo, bodyMat);
+        body.position.y = 0.01;
+        car.add(body);
+        
+        const cabinGeo = new THREE.BoxGeometry(0.1, 0.06, 0.12);
+        const cabinMat = new THREE.MeshPhysicalMaterial({
+             color: 0x00ffff,
+             transparent: true,
+             opacity: 0.3,
+             metalness: 0.9,
+             roughness: 0,
+             transmission: 0.5
+        });
+        const cabin = new THREE.Mesh(cabinGeo, cabinMat);
+        cabin.position.y = 0.08;
+        cabin.position.z = -0.02;
+        car.add(cabin);
+        
+        // Headlights (white emissive)
+        const headlightGeo = new THREE.BoxGeometry(0.02, 0.01, 0.005);
+        const headlightMat = new THREE.MeshBasicMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 1.5 });
+        const headlightLeft = new THREE.Mesh(headlightGeo, headlightMat);
+        headlightLeft.position.set(-0.045, 0.03, -0.14);
+        car.add(headlightLeft);
+        const headlightRight = new THREE.Mesh(headlightGeo, headlightMat);
+        headlightRight.position.set(0.045, 0.03, -0.14);
+        car.add(headlightRight);
+
+        // Taillights (red emissive)
+        const tailLightGeo = new THREE.BoxGeometry(0.04, 0.01, 0.005);
+        const tailLightMat = new THREE.MeshBasicMaterial({ color: 0xff0000, emissive: 0xff0000, emissiveIntensity: 1 });
+        const tailLight = new THREE.Mesh(tailLightGeo, tailLightMat);
+        tailLight.position.set(0, 0.02, 0.14);
+        car.add(tailLight);
+
+        car.castShadow = true;
+        return car;
+    }
+    
+    function createEnhancedObstacle() {
+      const enemy = new THREE.Group();
+      
+      const bodyShape = new THREE.Shape();
+      bodyShape.moveTo(-0.03, 0);
+      bodyShape.lineTo(-0.03, 0.04);
+      bodyShape.quadraticCurveTo(0, 0.05, 0.03, 0.04);
+      bodyShape.lineTo(0.03, 0);
+      bodyShape.closePath();
+      
+      const bodyGeo = new THREE.ExtrudeGeometry(bodyShape, {
+        depth: 0.14,
+        bevelEnabled: true,
+        bevelThickness: 0.005,
+        bevelSize: 0.003,
+        bevelSegments: 4
+      });
+      
+      const bodyMat = new THREE.MeshPhongMaterial({ 
+        color: 0x8338ec,
+        emissive: 0x8338ec,
+        emissiveIntensity: 0.4,
+        metalness: 0.7,
+        roughness: 0.3
+      });
+      const body = new THREE.Mesh(bodyGeo, bodyMat);
+      body.rotation.x = Math.PI / 2;
+      body.position.set(0, 0.02, 0.07);
+      enemy.add(body);
+      
+      const headlightGeo = new THREE.ConeGeometry(0.015, 0.03, 8);
+      const headlightMat = new THREE.MeshBasicMaterial({ 
+        color: 0x00ffff,
+        transparent: true,
+        opacity: 0.9
+      });
+      const headlight = new THREE.Mesh(headlightGeo, headlightMat);
+      headlight.rotation.x = Math.PI / 2;
+      headlight.position.set(0, 0.03, -0.05);
+      enemy.add(headlight);
+      
+      const exhaustGeo = new THREE.SphereGeometry(0.012, 8, 8);
+      const exhaustMat = new THREE.MeshBasicMaterial({
+        color: 0xffaa00,
+        transparent: true,
+        opacity: 0.8
+      });
+      const exhaust = new THREE.Mesh(exhaustGeo, exhaustMat);
+      exhaust.position.set(0, 0.02, 0.06);
+      enemy.add(exhaust);
+      
+      const riderGeo = new THREE.CapsuleGeometry(0.015, 0.03, 6, 6);
+      const riderMat = new THREE.MeshPhongMaterial({ 
+        color: 0x000000,
+        emissive: 0x440088,
+        emissiveIntensity: 0.2
+      });
+      const rider = new THREE.Mesh(riderGeo, riderMat);
+      rider.position.set(0, 0.06, 0.02);
+      enemy.add(rider);
+      
+      enemy.castShadow = true;
+      return enemy;
+    }
+    
+    function createCityscape() {
+      for (let i = 0; i < 20; i++) {
+        const buildingHeight = 4 + Math.random() * 8;
+        const bWidth = 0.4 + Math.random() * 0.6;
+        const bDepth = 0.4 + Math.random() * 0.6;
+        const buildingGeo = new THREE.BoxGeometry(bWidth, buildingHeight, bDepth);
+        const buildingMat = new THREE.MeshPhongMaterial({
+          color: 0x0a0a1a,
+          emissive: 0x110022,
+          emissiveIntensity: 0.2
+        });
+        const building = new THREE.Mesh(buildingGeo, buildingMat);
+        building.position.set(
+          (Math.random() > 0.5 ? 1 : -1) * (1.2 + Math.random() * 3),
+          GROUND_HEIGHT + buildingHeight / 2 - 2,
+          -5 - Math.random() * 30
+        );
+        scene.add(building);
+
+        if (buildingHeight > 8 && Math.random() > 0.5) {
+            createAnimatedBillboard(building);
+        }
+        
+        const windowGeo = new THREE.PlaneGeometry(0.03, 0.03);
+        const staticWindowMat = new THREE.MeshBasicMaterial({
+          color: new THREE.Color().setHSL(Math.random() * 0.2 + 0.8, 1, 0.7),
+          transparent: true,
+          opacity: 0.9
+        });
+        
+        for (let j = 0; j < 50; j++) {
+          const isBlinking = Math.random() > 0.4;
+          const window = new THREE.Mesh(
+            windowGeo, 
+            isBlinking ? new THREE.MeshBasicMaterial({
+              color: new THREE.Color().setHSL(Math.random() * 0.2 + 0.8, 1, 0.7),
+              transparent: true,
+              opacity: Math.random() > 0.5 ? 0.9 : 0
+            }) : staticWindowMat.clone()
+          );
+          
+          window.position.copy(building.position);
+          window.position.x += (Math.random() - 0.5) * bWidth;
+          window.position.y += (Math.random() - 0.5) * buildingHeight;
+          window.position.z += bDepth / 2 + 0.01;
+          
+          if (isBlinking) {
+            window.userData.blinking = true;
+            window.userData.blinkSpeed = 0.5 + Math.random() * 3;
+            window.userData.blinkOffset = Math.random() * Math.PI * 2;
+            window.userData.blinkPattern = Math.random();
+            blinkingWindows.push(window);
+          }
+          scene.add(window);
+        }
+      }
+    }
+
+    function createAnimatedBillboard(building) {
+        const canvas = document.createElement('canvas');
+        
+        const bParams = building.geometry.parameters;
+        let billboardWidth = bParams.width * (0.7 + Math.random() * 0.25);
+        let billboardHeight = billboardWidth * (0.8 + Math.random() * 0.4);
+
+        if (billboardHeight > bParams.height * 0.8) {
+            billboardHeight = bParams.height * 0.8;
+        }
+
+        canvas.width = 512;
+        canvas.height = Math.floor(512 * (billboardHeight / billboardWidth));
+        const context = canvas.getContext('2d');
+        
+        const texture = new THREE.CanvasTexture(canvas);
+        const material = new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide });
+        const geometry = new THREE.PlaneGeometry(billboardWidth, billboardHeight);
+        const billboard = new THREE.Mesh(geometry, material);
+
+        billboard.position.copy(building.position);
+        billboard.position.y += (Math.random() - 0.5) * (bParams.height - billboardHeight);
+        billboard.position.z += bParams.depth / 2 + 0.02;
+        scene.add(billboard);
+
+        animatedBillboards.push({
+            context: context,
+            texture: texture,
+            width: canvas.width,
+            height: canvas.height,
+            type: Math.random() > 0.5 ? 'glitch' : 'text',
+            textPos: canvas.width,
+            phrase: ["Still caring? Try Electroshock", "Vote Haulik", "Skip food with BlueGue", "Live online @ NXT/WebXR"][Math.floor(Math.random()*4)]
+        });
+    }
+
+    function updateAnimatedBillboards() {
+        animatedBillboards.forEach(bb => {
+            const ctx = bb.context;
+            const w = bb.width;
+            const h = bb.height;
+
+            if (bb.type === 'glitch') {
+                if (Math.random() > 0.8) { 
+                    ctx.fillStyle = `rgb(0,0,${Math.floor(Math.random()*20)})`;
+                    ctx.fillRect(0, 0, w, h);
+                    for (let i = 0; i < 20; i++) {
+                        ctx.fillStyle = `hsl(${180 + Math.random()*60}, 100%, ${50 + Math.random()*40}%)`;
+                        ctx.fillRect(Math.random() * w, Math.random() * h, Math.random() * w / 4, Math.random() * h / 4);
+                    }
+                }
+            } else { 
+                ctx.fillStyle = '#110022';
+                ctx.fillRect(0, 0, w, h);
+                ctx.font = `bold ${Math.floor(h*0.4)}px 'Courier New'`;
+                ctx.fillStyle = '#00ffff';
+                ctx.fillText(bb.phrase, bb.textPos, h * 0.6);
+                bb.textPos -= 2;
+                if (bb.textPos < -ctx.measureText(bb.phrase).width) {
+                    bb.textPos = w;
+                }
+            }
+            
+            bb.texture.needsUpdate = true;
+        });
+    }
+    
+    function updateBlinkingWindows() {
+      blinkingWindows.forEach(window => {
+        if (window.userData.blinkPattern < 0.3) {
+          window.material.opacity = Math.sin(time * window.userData.blinkSpeed + window.userData.blinkOffset) * 0.45 + 0.45;
+        } else if (window.userData.blinkPattern < 0.6) {
+          if (Math.random() > 0.95) {
+            window.material.opacity = window.material.opacity > 0.5 ? 0 : 0.9;
+          }
+        } else {
+          const cycle = (time * window.userData.blinkSpeed + window.userData.blinkOffset) % (Math.PI * 2);
+          window.material.opacity = cycle < Math.PI ? 0.9 : 0;
+        }
+      });
+    }
+    
+    function createSpeedParticle() {
+      const geo = new THREE.BoxGeometry(0.003, 0.003, 0.15);
+      const mat = new THREE.MeshBasicMaterial({
+        color: new THREE.Color().setHSL(Math.random() * 0.2 + 0.8, 1, 0.8),
+        transparent: true,
+        opacity: 1
+      });
+      const particle = new THREE.Mesh(geo, mat);
+      particle.position.set(
+        (Math.random() - 0.5) * 1,
+        GROUND_HEIGHT + Math.random() * 0.6,
+        -5 - Math.random() * 5
+      );
+      particle.userData.speed = 0.4 + Math.random() * 0.3;
+      particle.rotation.z = Math.random() * Math.PI;
+      particles.push(particle);
+      scene.add(particle);
+    }
+    
+    function createBoostParticle() {
+      const geo = new THREE.SphereGeometry(0.008, 6, 6);
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xff0033,
+        transparent: true,
+        opacity: 0.8
+      });
+      const particle = new THREE.Mesh(geo, mat);
+      particle.position.copy(bike.position);
+      particle.position.z += 0.08;
+      particle.position.x += (Math.random() - 0.5) * 0.02;
+      particle.position.y += Math.random() * 0.02;
+      boostParticles.push(particle);
+      scene.add(particle);
+    }
+    
+    async function startARSession() {
+      if (!navigator.xr) { alert('WebXR not supported'); return; }
+      try {
+        const bgMusic = document.getElementById('bgMusic');
+        if (bgMusic.paused) {
+          bgMusic.play().catch(e => console.log('Could not start music:', e));
+        }
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test'],
+          optionalFeatures: ['dom-overlay'],
+          domOverlay: { root: document.body }
+        });
+        onSessionStarted(session);
+      } catch (error) { alert('Failed to start AR: ' + error.message); }
+    }
+    
+    function onSessionStarted(session) {
+      xrSession = session;
+      document.getElementById('overlay').classList.add('webxr-hidden');
+      renderer.xr.setReferenceSpaceType('local');
+      renderer.xr.setSession(session);
+      setupControllers(session);
+      renderer.setAnimationLoop(render);
+      session.addEventListener('end', onSessionEnd);
+      startControllerSelection();
+    }
+    
+    function startControllerSelection() {
+      isControllerSelectionPhase = true;
+      controllerSelectionStartTime = clock.getElapsedTime();
+      controllerHoldStartTime = {};
+    }
+    
+    function setupControllers(session) {
+      controllers = [];
+      for (let i = 0; i < 2; i++) {
+        const controller = renderer.xr.getController(i);
+        scene.add(controller);
+        controllers.push(controller);
+      }
+    }
+    
+    function checkControllerSelection() {
+      if (!isControllerSelectionPhase) return;
+      
+      const currentTime = clock.getElapsedTime();
+      let highestY = -999, highestIndex = -1;
+      
+      for (let i = 0; i < controllers.length; i++) {
+        if (controllers[i].visible && controllers[i].position.y > highestY) {
+          highestY = controllers[i].position.y;
+          highestIndex = i;
+        }
+      }
+      
+      if (highestIndex >= 0) {
+        const ctrl = controllers[highestIndex];
+        const inFront = ctrl.position.z > -0.8 && ctrl.position.z < -0.3 && Math.abs(ctrl.position.x) < 0.3;
+        
+        if (inFront) {
+          if (!controllerHoldStartTime[highestIndex]) controllerHoldStartTime[highestIndex] = currentTime;
+          if ((currentTime - controllerHoldStartTime[highestIndex]) * 1000 >= 3000) {
+            activeController = ctrl;
+            activeControllerIndex = highestIndex;
+            isControllerSelectionPhase = false;
+          }
+        } else { controllerHoldStartTime[highestIndex] = null; }
+      }
+      
+      if ((currentTime - controllerSelectionStartTime) * 1000 >= 10000) {
+        activeController = controllers[0];
+        isControllerSelectionPhase = false;
+      }
+    }
+    
+    function updateGame() {
+      time += 0.016;
+      
+      if (activeController && activeController.visible) {
+        const ctrlX = activeController.position.x;
+        if (ctrlX < -0.12) targetLane = 0;
+        else if (ctrlX > 0.12) targetLane = 2;
+        else targetLane = 1;
+      }
+      
+      const targetX = LANES[targetLane];
+      const deltaX = targetX - bike.position.x;
+      bike.position.x += deltaX * 0.12;
+      bike.rotation.z = deltaX * 3;
+      bike.rotation.y = deltaX * 0.5;
+      
+      updateLightTrail();
+      updateBlinkingWindows();
+      updateAnimatedBillboards();
+      updateDroneBillboard();
+      
+      if (engineGlow) {
+        engineGlow.material.opacity = 0.5 + Math.sin(time * 20) * 0.2;
+        engineGlow.scale.x = 1 + Math.sin(time * 15) * 0.1;
+        engineGlow.scale.z = 1 + Math.cos(time * 15) * 0.1;
+      }
+      
+      roadSegments.forEach((segment) => {
+        segment.position.z += speed;
+      });
+
+      // --- OPTIMIZATION: Object Pooling Logic ---
+      const firstSegment = roadSegments[0];
+      if (firstSegment && firstSegment.position.z > 2) {
+          // 1. Remove segment from the front of the array
+          const recycledSegment = roadSegments.shift();
+          
+          // Clean up old obstacles from this segment
+          obstacles = obstacles.filter(obs => obs.segment !== recycledSegment);
+          
+          // Dispose of the old segment's contents to prevent memory leaks
+          // Only dispose if it's not a pre-cached asset (like the tunnel shell geo)
+          recycledSegment.children.forEach(child => {
+              if (child.isMesh && child.geometry !== tunnelAssets.shellGeo && child.geometry !== tunnelAssets.roadGeo && child.geometry !== tunnelAssets.ceilingGeo) {
+                  child.geometry.dispose();
+                  if (child.material.isMaterial) {
+                     if (child.material.map) child.material.map.dispose();
+                     child.material.dispose();
+                  }
+              }
+          });
+          scene.remove(recycledSegment); // Remove from scene
+
+          // 2. Get the position of the last segment
+          const furthestZ = roadSegments[roadSegments.length - 1].position.z;
+
+          // 3. Update environment state
+          environmentCounter--;
+          if (environmentCounter <= 0) {
+              const rand = Math.random();
+              if (rand < 0.33) {
+                  currentEnvironment = 'tunnel';
+                  environmentCounter = 30 + Math.random() * 20;
+              } else if (rand < 0.66) {
+                  currentEnvironment = 'bridge';
+                  environmentCounter = 40 + Math.random() * 30;
+              } else {
+                  currentEnvironment = 'city';
+                  environmentCounter = 50 + Math.random() * 40;
+              }
+          }
+          
+          // 4. Create new segment based on environment
+          let newSegment;
+          if (currentEnvironment === 'tunnel') {
+              newSegment = createOptimizedTunnelSegment();
+          } else if (currentEnvironment === 'bridge') {
+              newSegment = createBridgeSegment();
+          } else {
+              newSegment = createRoadSegment();
+          }
+          
+          // 5. Place the new segment and add it to the scene and array
+          newSegment.position.z = furthestZ - SEGMENT_LENGTH;
+          scene.add(newSegment);
+          roadSegments.push(newSegment);
+      }
+      
+      obstacles.forEach(obs => {
+        const dist = Math.abs(obs.mesh.getWorldPosition(new THREE.Vector3()).z - bike.position.z);
+        const laneDist = Math.abs(obs.lane - bike.position.x);
+        if (dist < 0.15 && laneDist < 0.1) {
+          for (let i = 0; i < 10; i++) createBoostParticle();
+          speed = Math.max(0.05, speed - 0.03);
+          obs.segment.remove(obs.mesh);
+          obstacles.splice(obstacles.indexOf(obs), 1);
+        }
+      });
+      
+      if (Math.random() > 0.6) createSpeedParticle();
+      particles.forEach((p, i) => {
+        p.position.z += p.userData.speed;
+        p.material.opacity -= 0.015;
+        p.rotation.x += 0.1;
+        p.rotation.y += 0.05;
+        if (p.position.z > 1 || p.material.opacity <= 0) {
+          scene.remove(p);
+          particles.splice(i, 1);
+        }
+      });
+      
+      boostParticles.forEach((p, i) => {
+        p.position.z += 0.2;
+        p.position.y += 0.01;
+        p.scale.multiplyScalar(0.95);
+        p.material.opacity -= 0.05;
+        if (p.material.opacity <= 0) {
+          scene.remove(p);
+          boostParticles.splice(i, 1);
+        }
+      });
+      
+      speed = Math.min(0.35, speed + 0.0003);
+      score += speed * 10;
+      
+      scene.children.forEach(child => {
+        if (child.isPointLight) {
+          child.intensity = 2 + Math.sin(time * 2 + child.position.x) * 0.5;
+        }
+      });
+    }
+    
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+    
+    function onSessionEnd() {
+      document.getElementById('overlay').classList.remove('webxr-hidden');
+      renderer.setAnimationLoop(null);
+      xrSession = null;
+    }
+    
+    function render(time, frame) {
+      if (frame) {
+        if (isControllerSelectionPhase) checkControllerSelection();
+        else updateGame();
+      }
+      renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>
